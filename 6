@@ -1,0 +1,469 @@
+
+Crop Classification Script with Balanced Samples and Error Fixes
+Version: 6.0
+Features: Balanced training pixels, Random Forest, Min-Max normalization, chunked processing, no PCA, error handling for non-contiguous indices
+"""
+
+import os
+import sys
+import time
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+import geopandas as gpd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.preprocessing import MinMaxScaler
+from rasterio.features import rasterize
+from shapely.geometry import mapping
+from pathlib import Path
+import tempfile
+import csv
+import gc
+from typing import Dict, List, Tuple
+import warnings
+warnings.filterwarnings('ignore')
+
+def safe_file_write(output_path, write_function, max_attempts=3):
+    """
+    Safely write a file with multiple attempts and fallback options
+    """
+    output_path = Path(output_path)
+    
+    for attempt in range(max_attempts):
+        try:
+            write_function(output_path)
+            print(f"✓ Successfully saved to: {output_path}")
+            return str(output_path)
+        except PermissionError:
+            print(f"❌ Permission error for {output_path} (attempt {attempt + 1})")
+            if attempt < max_attempts - 1:
+                time.sleep(1)
+                continue
+            break
+        except Exception as e:
+            print(f"❌ Write error for {output_path}: {e}")
+            break
+    
+    timestamp = int(time.time())
+    timestamped_path = output_path.parent / f"{output_path.stem}_{timestamp}{output_path.suffix}"
+    
+    try:
+        write_function(timestamped_path)
+        print(f"✓ Successfully saved to: {timestamped_path}")
+        return str(timestamped_path)
+    except Exception as e:
+        print(f"❌ Write error for timestamped path: {e}")
+    
+    temp_dir = Path(tempfile.gettempdir())
+    temp_path = temp_dir / output_path.name
+    try:
+        write_function(temp_path)
+        print(f"✓ Successfully saved to temporary directory: {temp_path}")
+        print(f"💡 Copy this file to your desired location if needed")
+        return str(temp_path)
+    except Exception as e:
+        print(f"❌ Write error for temporary directory: {e}")
+        raise Exception("Failed to write file to any location")
+
+def create_efficient_mask(shapes: List, raster_shape: Tuple, raster_transform, class_label: int, chunk_size: int = 1000) -> np.ndarray:
+    """
+    Efficiently create a mask with optimized chunk processing
+    """
+    mask = np.zeros(raster_shape, dtype=np.uint8)
+    
+    try:
+        mask = rasterize(shapes, out_shape=raster_shape, transform=raster_transform, 
+                         fill=0, default_value=class_label, dtype=np.uint8)
+        return mask
+    except MemoryError:
+        print(f"    Using chunked processing for class {class_label}")
+        for i in range(0, raster_shape[0], chunk_size):
+            for j in range(0, raster_shape[1], chunk_size):
+                i_end = min(i + chunk_size, raster_shape[0])
+                j_end = min(j + chunk_size, raster_shape[1])
+                chunk_shape = (i_end - i, j_end - j)
+                
+                left, top = rasterio.transform.xy(raster_transform, i, j, offset='ul')
+                right, bottom = rasterio.transform.xy(raster_transform, i_end, j_end, offset='lr')
+                chunk_transform = rasterio.transform.from_bounds(left, bottom, right, top, 
+                                                                chunk_shape[1], chunk_shape[0])
+                
+                chunk_mask = rasterize(shapes, out_shape=chunk_shape, transform=chunk_transform, 
+                                       fill=0, default_value=class_label, dtype=np.uint8)
+                mask[i:i_end, j:j_end] = np.maximum(mask[i:i_end, j:j_end], chunk_mask)
+        return mask
+
+def extract_training_pixels(src: rasterio.io.DatasetReader, mask: np.ndarray, class_label: int, max_samples: int = 50000, batch_size: int = 1000) -> Tuple[np.ndarray, List]:
+    """
+    Extract training pixels from raster using index-based access for non-contiguous indices
+    """
+    mask_indices = np.where(mask == class_label)
+    if len(mask_indices[0]) == 0:
+        return np.array([]).reshape(0, src.count), []
+    
+    if len(mask_indices[0]) > max_samples:
+        indices = np.random.choice(len(mask_indices[0]), max_samples, replace=False)
+        mask_indices = (mask_indices[0][indices], mask_indices[1][indices])
+    
+    pixel_values = []
+    for i in range(0, len(mask_indices[0]), batch_size):
+        i_end = min(i + batch_size, len(mask_indices[0]))
+        batch_rows = mask_indices[0][i:i_end]
+        batch_cols = mask_indices[1][i:i_end]
+        
+        batch_pixels = np.array([
+            src.read(window=Window(col, row, 1, 1)).flatten().astype(np.float32)
+            for row, col in zip(batch_rows, batch_cols)
+        ])
+        valid_pixels = batch_pixels[~np.isnan(batch_pixels).any(axis=1)]
+        pixel_values.append(valid_pixels)
+    
+    if not pixel_values:
+        return np.array([]).reshape(0, src.count), []
+    
+    pixel_values = np.vstack(pixel_values)
+    labels = [class_label] * len(pixel_values)
+    
+    return pixel_values, labels
+
+def preprocess_raster(src: rasterio.io.DatasetReader, scaler, chunk_size: int = 200) -> np.ndarray:
+    """
+    Preprocess entire raster with Min-Max scaling in chunks
+    """
+    raster_shape = (src.height, src.width)
+    processed_data = np.zeros((src.count, raster_shape[0], raster_shape[1]), dtype=np.float32)
+    total_chunks = ((raster_shape[0] + chunk_size - 1) // chunk_size) * ((raster_shape[1] + chunk_size - 1) // chunk_size)
+    processed_chunks = 0
+    
+    print(f"Preprocessing {total_chunks} chunks of size {chunk_size}x{chunk_size}...")
+    
+    for i in range(0, raster_shape[0], chunk_size):
+        for j in range(0, raster_shape[1], chunk_size):
+            i_end = min(i + chunk_size, raster_shape[0])
+            j_end = min(j + chunk_size, raster_shape[1])
+            window = Window(j, i, j_end - j, i_end - i)
+            chunk = src.read(window=window).astype(np.float32)
+            chunk_height, chunk_width = chunk.shape[1], chunk.shape[2]
+            chunk_reshaped = chunk.reshape(chunk.shape[0], -1).T
+            valid_mask = ~np.any(np.isnan(chunk_reshaped), axis=1)
+            
+            if np.sum(valid_mask) > 0:
+                valid_pixels = chunk_reshaped[valid_mask]
+                valid_pixels_scaled = scaler.transform(valid_pixels)
+                chunk_result = np.zeros((chunk_height * chunk_width, src.count), dtype=np.float32)
+                chunk_result[valid_mask] = valid_pixels_scaled
+                processed_data[:, i:i_end, j:j_end] = chunk_result.reshape(chunk_height, chunk_width, src.count).transpose(2, 0, 1)
+            
+            processed_chunks += 1
+            print(f"Preprocessed chunk {processed_chunks}/{total_chunks} ({100*processed_chunks/total_chunks:.1f}%)")
+            
+            del chunk, chunk_reshaped
+            gc.collect()
+    
+    return processed_data
+
+def classify_image_chunks(processed_data: np.ndarray, classifier, chunk_size: int = 200) -> np.ndarray:
+    """
+    Classify preprocessed image in chunks
+    """
+    raster_shape = processed_data.shape[1:]
+    predictions = np.zeros(raster_shape, dtype=np.uint8)
+    total_chunks = ((raster_shape[0] + chunk_size - 1) // chunk_size) * ((raster_shape[1] + chunk_size - 1) // chunk_size)
+    processed_chunks = 0
+    
+    print(f"Classifying {total_chunks} chunks of size {chunk_size}x{chunk_size}...")
+    
+    for i in range(0, raster_shape[0], chunk_size):
+        for j in range(0, raster_shape[1], chunk_size):
+            i_end = min(i + chunk_size, raster_shape[0])
+            j_end = min(j + chunk_size, raster_shape[1])
+            chunk = processed_data[:, i:i_end, j:j_end]
+            chunk_height, chunk_width = chunk.shape[1], chunk.shape[2]
+            chunk_reshaped = chunk.reshape(chunk.shape[0], -1).T
+            valid_mask = ~np.any(np.isnan(chunk_reshaped), axis=1)
+            
+            if np.sum(valid_mask) > 0:
+                valid_pixels = chunk_reshaped[valid_mask]
+                chunk_predictions = classifier.predict(valid_pixels)
+                chunk_result = np.zeros(chunk_height * chunk_width, dtype=np.uint8)
+                chunk_result[valid_mask] = chunk_predictions
+                predictions[i:i_end, j:j_end] = chunk_result.reshape(chunk_height, chunk_width)
+            
+            processed_chunks += 1
+            print(f"Classified chunk {processed_chunks}/{total_chunks} ({100*processed_chunks/total_chunks:.1f}%)")
+            
+            del chunk, chunk_reshaped
+            gc.collect()
+    
+    return predictions
+
+def main():
+    # Configuration
+    tiff_path = r"C:\Users\User\Desktop\Настя\New Folder\tc_decomposition_export.tif"
+    shp_paths = {
+        "пшеница": r"C:\Users\User\Desktop\Настя\борисовка\пшеница.shp",
+        "овес": r"C:\Users\User\Desktop\Настя\борисовка\овес.shp",
+        "ячмень": r"C:\Users\User\Desktop\Настя\борисовка\ячмень.shp"
+    }
+    output_dir = Path(r"C:\Users\User\Desktop\Настя\outputs")
+    output_dir.mkdir(exist_ok=True)
+    base_output_path = output_dir / "classified_image_fixed_v6.tif"
+    confusion_matrix_path = output_dir / "confusion_matrix_fixed_v6.csv"
+    data_stats_path = output_dir / "data_statistics_fixed_v6.csv"
+
+    print("🌾 Fixed Crop Classification Tool - Version 5.6")
+    print("=" * 60)
+    print(f"📁 Input raster: {tiff_path}")
+    print(f"📁 Output directory: {output_dir}")
+
+    # Step 1: Open raster for chunked reading
+    print("\n📖 Opening raster for chunked reading...")
+    try:
+        src = rasterio.open(tiff_path)
+        raster_meta = src.meta.copy()
+        raster_transform = src.transform
+        raster_crs = src.crs
+        raster_shape = (src.height, src.width)
+        print(f"✓ Raster opened: {src.count} channels, {src.height}x{src.width}")
+    except Exception as e:
+        print(f"❌ Error opening raster: {e}")
+        sys.exit(1)
+
+    # For testing on a smaller raster (uncomment if needed):
+    # raster_shape = (4000, 4000)
+
+    # Step 2: Load shapefiles and create masks
+    print("\n📖 Loading training data from shapefiles...")
+    combined_mask = np.zeros(raster_shape, dtype=np.uint8)
+    class_labels = {"пшеница": 1, "овес": 2, "ячмень": 3}
+    all_features = []
+    all_labels = []
+
+    for crop, shp_path in shp_paths.items():
+        if not Path(shp_path).exists():
+            print(f"⚠️ Shapefile not found: {shp_path}")
+            continue
+        
+        print(f"  Processing {crop}...")
+        try:
+            gdf = gpd.read_file(shp_path)
+            if gdf.crs != raster_crs:
+                print(f"    Converting CRS for {crop}...")
+                gdf = gdf.to_crs(raster_crs)
+            
+            gdf = gdf[gdf.is_valid]
+            if gdf.empty:
+                print(f"    ⚠️ Shapefile {crop} is empty or contains invalid geometries")
+                continue
+            
+            shapes = [(mapping(geom), class_labels[crop]) for geom in gdf.geometry]
+            
+            crop_mask = create_efficient_mask(shapes, raster_shape, raster_transform, class_labels[crop])
+            combined_mask[crop_mask > 0] = crop_mask[crop_mask > 0]
+            
+            print(f"    ✓ Mask size for {crop}: {np.sum(crop_mask > 0)} pixels")
+            
+            features, labels = extract_training_pixels(src, crop_mask, class_labels[crop])
+            if len(features) > 0:
+                all_features.append(features)
+                all_labels.extend(labels)
+                print(f"    ✓ {len(features)} training pixels extracted")
+            else:
+                print(f"    ⚠️ No valid pixels for {crop}")
+                
+        except Exception as e:
+            print(f"    ❌ Error processing {crop}: {e}")
+
+    # Step 3: Add "everything else" class (0)
+    print("\n📖 Adding 'everything else' class...")
+    np.random.seed(42)
+    sample_size = 100000
+    random_i = np.random.randint(0, raster_shape[0], size=sample_size * 2)
+    random_j = np.random.randint(0, raster_shape[1], size=sample_size * 2)
+    non_crop_mask = combined_mask[random_i, random_j] == 0
+    non_crop_indices = (random_i[non_crop_mask][:sample_size], random_j[non_crop_mask][:sample_size])
+    print(f"✓ Selected pixels for 'everything else': {len(non_crop_indices[0])}")
+
+    pixel_values = []
+    for i in range(0, len(non_crop_indices[0]), 1000):
+        i_end = min(i + 1000, len(non_crop_indices[0]))
+        batch_rows = non_crop_indices[0][i:i_end]
+        batch_cols = non_crop_indices[1][i:i_end]
+        batch_pixels = np.array([
+            src.read(window=Window(col, row, 1, 1)).flatten().astype(np.float32)
+            for row, col in zip(batch_rows, batch_cols)
+        ])
+        valid_pixels = batch_pixels[~np.isnan(batch_pixels).any(axis=1)]
+        pixel_values.append(valid_pixels)
+    
+    if pixel_values:
+        pixel_values = np.vstack(pixel_values)
+        all_features.append(pixel_values)
+        all_labels.extend([0] * len(pixel_values))
+        print(f"✓ {len(pixel_values)} training pixels extracted for 'everything else'")
+    else:
+        print(f"⚠️ No valid pixels for 'everything else'")
+
+    # Free memory
+    del combined_mask, pixel_values
+    gc.collect()
+
+    # Step 4: Data diagnostics
+    print("\n📊 Data diagnostics...")
+    X = np.vstack(all_features).astype(np.float32)
+    y = np.array(all_labels)
+    print(f"✓ Training data prepared:")
+    print(f"  - Total samples: {len(X)}")
+    print(f"  - Features: {X.shape[1]}")
+    
+    unique, counts = np.unique(y, return_counts=True)
+    label_mapping = {0: "всё остальное", 1: "пшеница", 2: "овёс", 3: "ячмень"}
+    for label, count in zip(unique, counts):
+        print(f"    {label_mapping[label]}: {count} samples")
+
+    with open(data_stats_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Class', 'Channel', 'Mean', 'Std', 'Min', 'Max'])
+        for label in unique:
+            class_data = X[y == label]
+            for channel in range(X.shape[1]):
+                mean = np.mean(class_data[:, channel])
+                std = np.std(class_data[:, channel])
+                min_val = np.min(class_data[:, channel])
+                max_val = np.max(class_data[:, channel])
+                writer.writerow([label_mapping[label], channel + 1, mean, std, min_val, max_val])
+    print(f"✓ Data statistics saved to: {data_stats_path}")
+
+    expected_classes = set([0, 1, 2, 3])
+    if set(unique) != expected_classes:
+        missing = expected_classes - set(unique)
+        missing_labels = [label_mapping[m] for m in missing]
+        print(f"❌ Error: Missing classes {missing_labels}. Check shapefiles.")
+        sys.exit(1)
+
+    # Step 5: Balance data and apply Min-Max scaling
+    print("\n⚖️ Balancing data...")
+    min_samples = min(counts)
+    max_samples_per_class = min(min_samples, 50000)
+    
+    balanced_X = []
+    balanced_y = []
+    for label in unique:
+        label_indices = np.where(y == label)[0]
+        if len(label_indices) > max_samples_per_class:
+            selected_indices = np.random.choice(label_indices, max_samples_per_class, replace=False)
+        else:
+            selected_indices = label_indices
+        balanced_X.append(X[selected_indices])
+        balanced_y.extend([label] * len(selected_indices))
+    
+    X_balanced = np.vstack(balanced_X).astype(np.float32)
+    y_balanced = np.array(balanced_y)
+    print(f"✓ Balanced dataset: {len(X_balanced)} samples")
+
+    print("\n📏 Applying Min-Max scaling...")
+    scaler = MinMaxScaler()
+    X_balanced_scaled = scaler.fit_transform(X_balanced)
+    print(f"✓ Data scaled to range [0, 1]")
+
+    # Free memory
+    del X, y, balanced_X
+    gc.collect()
+
+    # Step 6: Train classifier
+    print("\n🤖 Training classifier...")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_balanced_scaled, y_balanced, test_size=0.3, random_state=42, stratify=y_balanced
+    )
+    
+    clf = RandomForestClassifier(n_estimators=20, max_depth=5, random_state=42, n_jobs=-1)
+    clf.fit(X_train, y_train)
+    print(f"✓ Random Forest classifier trained with n_estimators=20, max_depth=5")
+
+    # Compute predictions and accuracy
+    y_pred = clf.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"✓ Validation accuracy: {accuracy:.4f}")
+
+    print("\n📊 Classification report:")
+    target_names = [label_mapping[i] for i in sorted(label_mapping.keys())]
+    print(classification_report(y_test, y_pred, target_names=target_names, zero_division=0))
+
+    # Step 7: Save confusion matrix
+    print("\n📈 Saving confusion matrix...")
+    def save_confusion_matrix(path):
+        cm = confusion_matrix(y_test, y_pred)
+        with open(path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([''] + target_names)
+            for i, row in enumerate(cm):
+                writer.writerow([target_names[i]] + list(row))
+
+    confusion_saved_path = safe_file_write(confusion_matrix_path, save_confusion_matrix)
+
+    # Free memory
+    del X_train, X_test, y_train, y_test
+    gc.collect()
+
+    # Step 8: Preprocess and classify entire image
+    print("\n🗺️ Preprocessing and classifying entire image...")
+    processed_data = preprocess_raster(src, scaler, chunk_size=200)
+    predictions = classify_image_chunks(processed_data, clf, chunk_size=200)
+
+    # Close raster
+    src.close()
+
+    # Check results
+    unique_pred, counts_pred = np.unique(predictions, return_counts=True)
+    print("\n📊 Class distribution in predictions:")
+    for pred, count in zip(unique_pred, counts_pred):
+        name = label_mapping.get(pred, f"Class_{pred}")
+        percentage = 100 * count / np.sum(counts_pred)
+        print(f"  {name}: {count:,} pixels ({percentage:.2f}%)")
+
+    if len(unique_pred) < 4:
+        print(f"⚠️ Warning: Only {len(unique_pred)} out of 4 classes detected!")
+        print(f"Detected classes: {[label_mapping.get(p, f'Class_{p}') for p in unique_pred]}")
+    else:
+        print("✓ All 4 classes successfully detected!")
+
+    # Step 9: Save result
+    print("\n💾 Saving classified raster...")
+    classified_meta = raster_meta.copy()
+    classified_meta.update({
+        'dtype': 'uint8',
+        'count': 1,
+        'compress': 'lzw'
+    })
+
+    def save_classified_image(path):
+        with rasterio.open(path, 'w', **classified_meta) as dst:
+            dst.write(predictions, 1)
+            colormap = {
+                0: (255, 255, 255, 255),  # White for "everything else"
+                1: (255, 255, 0, 255),    # Yellow for wheat
+                2: (0, 255, 0, 255),      # Green for oats
+                3: (0, 0, 255, 255)       # Blue for barley
+            }
+            dst.write_colormap(1, colormap)
+
+    final_output_path = safe_file_write(base_output_path, save_classified_image)
+    print(f"✓ Classified image saved to: {final_output_path}")
+
+    # Free memory
+    del processed_data, predictions, X_balanced_scaled
+    gc.collect()
+
+    print("\n🎉 Classification completed successfully!")
+    print(f"📊 Final statistics: {len(unique_pred)} classes detected")
+    print("\n💡 Next steps:")
+    print("  - Check data_statistics_fixed_v6.csv for channel overlap (similar means/std across classes)")
+    print("  - If only one class is detected, try QGIS SCP with normalization (Min-Max or StandardScaler)")
+    print("  - For faster testing, uncomment the reduced raster code (raster_shape = (4000, 4000))")
+    print("  - Close QGIS before running to avoid file access errors")
+    print("  - Share data_statistics_fixed_v6.csv and shapefile details for further analysis")
+
+if __name__ == "__main__":
+    main()
